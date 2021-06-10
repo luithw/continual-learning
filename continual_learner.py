@@ -145,6 +145,34 @@ class ContinualLearner(nn.Module, metaclass=abc.ABCMeta):
         self.train(mode=mode)
 
 
+    def random_fisher(self):
+        '''After completing training on a task, create a random Fisher Information matrix.'''
+
+        # Prepare <dict> to store estimated Fisher Information matrix
+        est_fisher_info = {}
+        for n, p in self.named_parameters():
+            if p.requires_grad:
+                n = n.replace('.', '__')
+                est_fisher_info[n] = torch.empty_like(p).normal_(mean=4e-4,std=8e-4).abs()
+
+        # Store new values in the network
+        for n, p in self.named_parameters():
+            if p.requires_grad:
+                n = n.replace('.', '__')
+                # -mode (=MAP parameter estimate)
+                self.register_buffer('{}_EWC_prev_task{}'.format(n, "" if self.online else self.EWC_task_count+1),
+                                     p.detach().clone())
+                # -precision (approximated by diagonal Fisher Information matrix)
+                if self.online and self.EWC_task_count==1:
+                    existing_values = getattr(self, '{}_EWC_estimated_fisher'.format(n))
+                    est_fisher_info[n] += self.gamma * existing_values
+                self.register_buffer('{}_EWC_estimated_fisher{}'.format(n, "" if self.online else self.EWC_task_count+1),
+                                     est_fisher_info[n])
+
+        # If "offline EWC", increase task-count (for "online EWC", set it to 1 to indicate EWC-loss can be calculated)
+        self.EWC_task_count = 1 if self.online else self.EWC_task_count + 1
+
+
     def ewc_loss(self):
         '''Calculate EWC-loss.'''
         if self.EWC_task_count>0:

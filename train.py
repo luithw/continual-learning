@@ -294,7 +294,8 @@ def train_cl(model, train_datasets, replay_mode="none", scenario="class",classes
             if model.mask_dict is not None:
                 model.apply_XdGmask(task=task)
             # -estimate FI-matrix
-            model.estimate_fisher(training_dataset, allowed_classes=allowed_classes)
+            # model.estimate_fisher(training_dataset, allowed_classes=allowed_classes)
+            model.random_fisher()
 
         # SI: calculate and update the normalized path integral
         if isinstance(model, ContinualLearner) and (model.si_c>0):
