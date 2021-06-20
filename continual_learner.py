@@ -3,7 +3,9 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch import autograd
 import utils
+
 
 
 class ContinualLearner(nn.Module, metaclass=abc.ABCMeta):
@@ -137,6 +139,93 @@ class ContinualLearner(nn.Module, metaclass=abc.ABCMeta):
                     est_fisher_info[n] += self.gamma * existing_values
                 self.register_buffer('{}_EWC_estimated_fisher{}'.format(n, "" if self.online else self.EWC_task_count+1),
                                      est_fisher_info[n])
+
+        # If "offline EWC", increase task-count (for "online EWC", set it to 1 to indicate EWC-loss can be calculated)
+        self.EWC_task_count = 1 if self.online else self.EWC_task_count + 1
+
+        # Set model back to its initial mode
+        self.train(mode=mode)
+
+    def estimate_hvp(self, dataset, allowed_classes=None, collate_fn=None):
+        '''After completing training on a task, estimate diagonal of Hessian Vector Product.
+
+        [dataset]:          <DataSet> to be used to estimate FI-matrix
+        [allowed_classes]:  <list> with class-indeces of 'allowed' or 'active' classes'''
+
+        # Prepare <dict> to store estimated Fisher Information matrix
+        est_hvp_info = {}
+        for n, p in self.named_parameters():
+            if p.requires_grad:
+                n = n.replace('.', '__')
+                est_hvp_info[n] = p.detach().clone().zero_()
+
+        # Set model to evaluation mode
+        mode = self.training
+        self.eval()
+
+        # Create data-loader to give batches of size 1
+        data_loader = utils.get_data_loader(dataset, batch_size=1, cuda=self._is_on_cuda(), collate_fn=collate_fn)
+
+        criteriton = nn.CrossEntropyLoss(reduce=False)
+        # Estimate the FI-matrix for [self.fisher_n] batches of size 1
+        for index,(x,y) in enumerate(data_loader):
+            # break from for-loop if max number of samples has been reached
+            if self.fisher_n is not None:
+                if index >= self.fisher_n:
+                    break
+            # run forward pass of model
+            x = x.to(self._device())
+            output = self(x) if allowed_classes is None else self(x)[:, allowed_classes]
+            if self.emp_FI:
+                # -use provided label to calculate loglikelihood --> "empirical Fisher":
+                label = torch.LongTensor([y]) if type(y)==int else y
+                if allowed_classes is not None:
+                    label = [int(np.where(i == allowed_classes)[0][0]) for i in label.numpy()]
+                    label = torch.LongTensor(label)
+                label = label.to(self._device())
+            else:
+                # -use predicted label to calculate loglikelihood:
+                label = output.max(1)[1]
+
+            losses = criteriton(output, label).unbind()
+
+            # Calculate gradient and hvp
+            self.zero_grad()
+            losses_grad = autograd.grad(
+                losses, self.parameters(),
+                create_graph=True,
+                retain_graph=True
+            )
+            grad_sum = torch.stack([g.sum() for g in losses_grad]).sum()
+            hvp = autograd.grad(
+                grad_sum,
+                self.parameters(),
+                only_inputs=True,
+                retain_graph=True
+            )
+            # Square gradients and keep running sum
+            for (n, p), hv in zip(self.named_parameters(), hvp):
+                if p.requires_grad:
+                    n = n.replace('.', '__')
+                    if p.grad is not None:
+                        est_hvp_info[n] += hv.detach() ** 2
+
+        # Normalize by sample size used for estimation
+        est_hvp_info = {n: p/index for n, p in est_hvp_info.items()}
+
+        # Store new values in the network
+        for n, p in self.named_parameters():
+            if p.requires_grad:
+                n = n.replace('.', '__')
+                # -mode (=MAP parameter estimate)
+                self.register_buffer('{}_EWC_prev_task{}'.format(n, "" if self.online else self.EWC_task_count+1),
+                                     p.detach().clone())
+                # -precision (approximated by diagonal Fisher Information matrix)
+                if self.online and self.EWC_task_count==1:
+                    existing_values = getattr(self, '{}_EWC_estimated_fisher'.format(n))
+                    est_hvp_info[n] += self.gamma * existing_values
+                self.register_buffer('{}_EWC_estimated_fisher{}'.format(n, "" if self.online else self.EWC_task_count+1),
+                                     est_hvp_info[n])
 
         # If "offline EWC", increase task-count (for "online EWC", set it to 1 to indicate EWC-loss can be calculated)
         self.EWC_task_count = 1 if self.online else self.EWC_task_count + 1
